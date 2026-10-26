@@ -37,6 +37,8 @@ uint64_t mtl_sub_commit(void);
 
 uint64_t mtl_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout
+int mtl_fence_failed(uint64_t fence);             // True after an execution error has invalidated this and later classic-queue fences
+#define MTL_PRESENT_ERROR UINT64_MAX               // mtl_present_ext failed before enqueueing the external frame
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns);   // the same for a sync WindowAcquireTexture handed out (its own line in the wait ledger, DM_NVN_WAITS)
 void mtl_finish(void);                               // Wait for all submitted commands to complete
 void mtl_drain(void);                                // Wait for all commands on the queue (including presents) to complete: submit an empty command buffer and wait for it

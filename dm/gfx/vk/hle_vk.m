@@ -1521,15 +1521,21 @@ VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {
     (void)q; dm_gfx_enter();
     pthread_mutex_lock(&g_qmu); uint64_t v = g_ev_val; pthread_mutex_unlock(&g_qmu);
     int crop[4]; dm_vi_layer_crop(crop);   // the vi layer crop (hle_vi.c): Super Mario Galaxy shows the top-left 1280x720 of its 1920x1080 swapchain in handheld mode
+    int present_error = 0;
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         VkSwapchainKHR sc = pi->pSwapchains[i]; uint32_t k = pi->pImageIndices[i];
+        int image_error = 0;
         int fit = crop[2] > 0 && crop[3] > 0 && k < sc->n && (uint32_t)(crop[0] + crop[2]) <= sc->img[k]->w && (uint32_t)(crop[1] + crop[3]) <= sc->img[k]->h;
-        if (k < sc->n) sc->ticket[k] = mtl_present_ext(sc->img[k]->serial, 1.0 / mtl_fps_target(), (__bridge void *)g_ev, v, fit ? crop : NULL);
-        if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
+        if (k < sc->n) {
+            uint64_t ticket = mtl_present_ext(sc->img[k]->serial, 1.0 / mtl_fps_target(), (__bridge void *)g_ev, v, fit ? crop : NULL);
+            if (ticket == MTL_PRESENT_ERROR) { sc->ticket[k] = 0; image_error = present_error = 1; }
+            else sc->ticket[k] = ticket;
+        }
+        if (pi->pResults) pi->pResults[i] = image_error ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     }
     dm_gfx_leave();
     frame_end();
-    return VK_SUCCESS;
+    return present_error ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 // ---------- Function lookup ----------

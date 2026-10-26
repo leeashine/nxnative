@@ -21,6 +21,14 @@ SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(s
 # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
 GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
 GFX_H=$(sort $(wildcard ../gfx/nvn/*.h ../gfx/nvn/*.inc ../gfx/nvn/include/*.h ../gfx/tex/*.h))   # *.inc: nvn_mtl.m includes them (nvn_geometry.inc); an edit there alone used not to rebuild the host
+# Classic Metal NVN execution layer (macOS 15 / iOS 18 floor): explicit opt-in with DM_NVN_M3=1; without it the Metal 4 layer above is the default and this whole block is inert.
+# The classic layer lives in dm/gfx/nvn/classic/ (outside the wildcard above, so the default source set is unchanged); the HLE, object layout, thunks, texture and reflection sources are shared with the Metal 4 build.
+# dm/ios/tools/gen_build.py derives the iOS sources from this file's expanded compile line, so the iOS build follows automatically.
+ifeq ($(DM_NVN_M3),1)
+CFLAGS += -DDM_NVN_M3=1 -mmacosx-version-min=15.0
+GFX := $(filter-out ../gfx/nvn/nvn_mtl.m,$(GFX)) $(sort $(wildcard ../gfx/nvn/classic/*.m))
+GFX_H += $(sort $(wildcard ../gfx/nvn/classic/*.h))
+endif
 # Third party: libvpx ships the VP8 and VP9 decoder sources (movie decoding, hle_movie.c), with its configuration headers in config/ (arm64, shared by Mac and iOS). Built separately into a static library, file by file, so host changes do not recompile it
 VPX=../third_party/libvpx
 VPX_SRC=$(sort $(shell find $(VPX) -name '*.c'))

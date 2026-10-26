@@ -9,10 +9,19 @@ CUTS = {
   '0d9649011312f62e93f6a5673a09d7e9': [
     (0xbecc08, 'dc820194', '1f2003d5', 'GCreateMalloc: bl 0xc4d778 (FMallocBinned3 constructor) → nop; the host allocator\'s vtable is put in at the gate after it (hle_uemalloc.c)'),
   ],
+  # The base game's main (v0) is made the same way at different addresses: GCreateMalloc at main+0xbd4330 keeps the object in x19 and calls FMallocBinned3 at main+0xc34eb8
+  # (its vtable lands at main+0x642c048); the constructor call is cut and the same observation gate installs the host vtable
+  '65619a04b8a04b10d44f9996ef141062': [
+    (0xbd4348, 'dc820194', '1f2003d5', 'GCreateMalloc: skip FMallocBinned3 constructor; install host malloc-zone vtable at the following gate'),
+  ],
 }
 OBS = {
   # OCTOPATH TRAVELER II 1.1.1 main: right after the cut FMallocBinned3 constructor call (CUTS above), x19 = the new allocator object; the host writes its vtable there (hle_uemalloc.c)
   '0d9649011312f62e93f6a5673a09d7e9': [
     (0xbecc0c, 21, 'aa1303e0', 'GCreateMalloc: the allocator object is in x19, before it is used: the host puts its vtable in; orig mov x0, x19'),
+  ],
+  # The base game's main: the same gate at the base build's address (x19 = the new allocator; original instruction mov x0, x19)
+  '65619a04b8a04b10d44f9996ef141062': [
+    (0xbd434c, 21, 'aa1303e0', 'OBS_UE_MALLOC: x19 holds the new allocator; original instruction mov x0, x19'),
   ],
 }

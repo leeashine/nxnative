@@ -23,10 +23,11 @@
 #include <stdatomic.h>
 
 // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions
-enum { UE5, UE4_27, UE5_6 };
+enum { UE5, UE4_27, UE5_6, UE4_20_SLOTS };
 static const struct { int nslot, malloc_, try_malloc, realloc_, try_realloc, free_, quantize, get_size, nothing[6]; } k_lay[] = {
     [UE5] = { 26, 6, 7, 8, 9, 10, 11, 12, { 13, 14, 15, 19 } },      // Trim, the TLS cache setup and teardown, DumpAllocatorStats
     [UE4_27] = { 21, 3, 4, 5, 6, 7, 8, 9, { 10, 11, 12, 16 } },
+    [UE4_20_SLOTS] = { 20, 3, 4, 5, 6, 7, 8, 9, { 10, 11, 12, 16 } },   // OCTOPATH TRAVELER II base game: 20 slots, same core ABI, no OnMallocInitialized
     [UE5_6] = { 32, 6, 7, 8, 9, 10, 13, 14, { 15, 16, 17, 18, 19, 23 } },   // Trim, the four TLS cache calls, DumpAllocatorStats
 };
 static const struct { const char *build, *what; int layout; uint64_t obj, vtable, cut; } k_ue[] = {
@@ -40,6 +41,8 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
     // OCTOPATH TRAVELER II 1.1.1 (Unreal Engine 4.27): made by GCreateMalloc, its vtable (main+0x64710b0: slots 0-19 as the 4.27 layout, TryMalloc / TryRealloc call +0x18 / +0x28,
     // slots 17 and 18 return 1, 19 the name; there is no OnMallocInitialized, so the 21st word copied is the next vtable's offset to top, which nothing calls), the cut constructor call (main+0xbecc08)
     { "0d9649011312f62e93f6a5673a09d7e9", "OCTOPATH TRAVELER II 1.1.1", UE4_27, 0, 0x64710b0, 0xbecc08 },
+    // OCTOPATH TRAVELER II base game (v0, UE4.27 with a 20-slot vtable): made by GCreateMalloc, its vtable (main+0x642c048), the cut constructor call (main+0xbd4348)
+    { "65619a04b8a04b10d44f9996ef141062", "OCTOPATH TRAVELER II (base)", UE4_20_SLOTS, 0, 0x642c048, 0xbd4348 },
     // SHIN MEGAMI TENSEI V: Vengeance 1.0.3: GCreateMalloc makes the object in x19; the constructor reserves 37 GB at main+0x15790b0. Its vtable has the UE4 layout:
     // TryMalloc / TryRealloc call +0x18 / +0x28, slots 17 and 18 return 1, 19 returns "Binned3"; the following word is 0 (no OnMallocInitialized).
     { "0a4f14a5c12f470a4d3168a8f2ae6005", "SHIN MEGAMI TENSEI V: Vengeance 1.0.3", UE4_27, 0, 0x5a7f0a8, 0x1f2f63c },

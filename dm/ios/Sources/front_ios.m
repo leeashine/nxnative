@@ -105,6 +105,7 @@ static void launcher_done(void) { [g_root startGame]; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
+int front_screen_max_fps(void) { return 0; }   // iOS does not expose a fixed desktop refresh rate (front.h: 0 = not known)
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
