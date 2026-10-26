@@ -37,6 +37,14 @@ for s in srcs:
     if s == os.path.join(host, 'main.c'): os.symlink(s, f'{gen}/main/main.c'); continue
     flat = os.path.relpath(s, os.path.dirname(host)).replace('/', '__')   # Same-named files in different directories do not collide
     os.symlink(s, f'{gen}/src/{flat}')
+# Preserve the Metal 4 A18 tuning; the iOS 18 classic backend uses generic arm64.
+if not any(d.startswith('-DDM_NVN_M3') for d in defs):
+    defs.append('-mcpu=apple-a18')
 print('HEADER_SEARCH_PATHS = $(inherited) ' + ' '.join(f'"{d}"' for d in incs + dirs))
 print('OTHER_CFLAGS = $(inherited) ' + ' '.join(defs))
 print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f != 'Cocoa'))
+# The deployment floor follows the graphics backend the host Makefile selected: the classic Metal backend (DM_NVN_M3=1) targets iOS 18, the Metal 4 backend iOS 26 (MTL4CommandQueue).
+# project.yml takes the same value as ${DM_DEPLOYMENT_TARGET} (build_ipa.sh exports what this line says before xcodegen); this xcconfig line is the build setting itself.
+dep = '18.0' if any(d.startswith('-DDM_NVN_M3') for d in defs) else '26.0'
+print(f'IPHONEOS_DEPLOYMENT_TARGET = {dep}')
+print(f'DM_DEPLOYMENT_TARGET = {dep}')

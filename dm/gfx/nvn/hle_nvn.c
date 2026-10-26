@@ -639,25 +639,107 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 }
 
 // ---------- Sync / events ----------
-NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
+static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;   // Serializes submits with queue-fence snapshots and waits.
+NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), SYNC_FENCE_NONE, 0}; return 1; }
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
-// A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
-// A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
-// ZCull data: the host does no ZCull, so there is nothing to save / restore
-NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
-NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
+    (void)q; (void)c; (void)f;
+#if DM_NVN_M3
+    pthread_mutex_lock(&g_sub_mu);
+    sync_t *o = (sync_t *)s;
+    if (!o || o->magic != MAGIC('S', 'Y', 'N', 'C')) {
+        pthread_mutex_unlock(&g_sub_mu);
+        LOG("[RED] QueueFenceSync received an uninitialized sync");
+        return;
+    }
+    o->fenced = SYNC_FENCE_QUEUE; o->fence = mtl_last_fence();
+    pthread_mutex_unlock(&g_sub_mu);
+#else
+    ((sync_t *)s)->fenced = SYNC_FENCE_QUEUE; ((sync_t *)s)->fence = mtl_last_fence();
+#endif
+}
+// A sync that was never fenced times out in SyncWait. A fenced queue wait needs no extra operation because this host serializes all submissions on one Metal queue.
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    (void)q;
+#if DM_NVN_M3
+    pthread_mutex_lock(&g_sub_mu);
+    const sync_t *o = (const sync_t *)s;
+    if (!o || o->magic != MAGIC('S', 'Y', 'N', 'C')) {
+        static int once;
+        if (!once++) LOG("[RED] QueueWaitSync received an uninitialized sync");
+        pthread_mutex_unlock(&g_sub_mu);
+        return 0;
+    }
+    if (o->fenced == SYNC_FENCE_NONE) {
+        static int once;
+        if (!once++) LOG("[RED] QueueWaitSync called before the sync was fenced; classic Metal cannot enqueue an unresolved wait");
+        pthread_mutex_unlock(&g_sub_mu);
+        return 0;
+    }
+    if (o->fenced != SYNC_FENCE_QUEUE && o->fenced != SYNC_FENCE_ACQUIRE && o->fenced != SYNC_FENCE_COMMAND_BUFFER) {
+        static int once;
+        if (!once++) LOG("[RED] QueueWaitSync received an invalid fence state");
+        pthread_mutex_unlock(&g_sub_mu);
+        return 0;
+    }
+    if (o->fence > mtl_last_fence()) {
+        static int once;
+        if (!once++) LOG("[RED] QueueWaitSync references a future fence not yet submitted to the Metal queue");
+        pthread_mutex_unlock(&g_sub_mu);
+        return 0;
+    }
+    if (mtl_fence_failed(o->fence)) {
+        static int once;
+        if (!once++) LOG("[RED] QueueWaitSync references a failed fence");
+        pthread_mutex_unlock(&g_sub_mu);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_sub_mu);
+#else
+    if (((const sync_t *)s)->fenced == SYNC_FENCE_NONE) {
+        static int once;
+        if (!once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait");
+    }
+#endif
+    return 1;
+}
+// The classic layer has no ZCull state to save. Report use instead of silently claiming the operation was applied.
+NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) {
+    (void)c; (void)a; (void)n;
+#if DM_NVN_M3
+    static int once;
+    if (!once++) LOG("[RED] RestoreZCullData is unsupported by classic Metal; no data restored");
+#endif
+}
+NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) {
+    (void)c; (void)a; (void)n;
+#if DM_NVN_M3
+    static int once;
+    if (!once++) LOG("[RED] SaveZCullData is unsupported by classic Metal; no data saved");
+#endif
+}
 static _Atomic uint64_t g_sync_ns;
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
-    if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
-    if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
-    return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    if (o->fenced == SYNC_FENCE_NONE) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    int (*w)(uint64_t, uint64_t) = o->fenced == SYNC_FENCE_ACQUIRE ? mtl_wait_acq : mtl_wait;
+    int done = w(o->fence, 0);
+    if (done) {
+#if DM_NVN_M3
+        if (mtl_fence_failed(o->fence)) return NVN_SYNC_WAIT_RESULT_FAILED;
+#endif
+        return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    }
+    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // time blocked by this SyncWait (@sync_ms)
+    if (ok) {
+#if DM_NVN_M3
+        if (mtl_fence_failed(o->fence)) return NVN_SYNC_WAIT_RESULT_FAILED;
+#endif
+        return NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED;
+    }
+    return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -852,6 +934,11 @@ NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCon
     (void)cond; (void)flags;
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_FENCE_SYNC, 16); memcpy(p + 8, &s, 8);
 }
+#if DM_NVN_M3
+NVN(nvnCommandBufferWaitSync, void, NVNcommandBuffer *c, const NVNsync *s) {
+    uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_WAIT_SYNC, 16); memcpy(p + 8, &s, 8);
+}
+#endif
 NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
@@ -1161,7 +1248,6 @@ void dm_gfx_suspend(int on) {
 // One submission at a time: the Metal replay keeps one command buffer and one upload batch for the submission in progress (nvn_mtl.m g_cb). Fire Emblem: Three Houses initializes two queues and
 // submits on both from two threads; the second submission arrived while the first was replaying and the host stopped with "submit re-entered" at the ninth frame. NVN orders work on different queues only
 // through syncs, so replaying the two queues' submissions in lock order is one valid order
-static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
     pthread_mutex_lock(&g_sub_mu);
@@ -1183,13 +1269,17 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     gfx_leave();
 }
 
-// Commands that only affect GPU state / only execute on the GPU: the null device only counts them (the thunk has already counted)
+// GPU debug markers are intentionally ignored. M4 retains its existing no-op entries (including WindowFinalize); M3 leaves unsupported GPU-state commands on the red-reporting stub.
 static void nvn_nop(void) {}
 static const char *const g_nops[] = {
+#if !DM_NVN_M3
     "nvnCommandBufferSetPatchSize",
     "nvnCommandBufferSetDepthBounds",
     "nvnCommandBufferWaitSync",
     "nvnCommandBufferSetShaderScratchMemory",
+    "nvnCommandBufferWaitEvent",
+    "nvnWindowFinalize",
+#endif
     "nvnCommandBufferPushDebugGroupDynamic",
     "nvnCommandBufferPopDebugGroup",
     "nvnCommandBufferInsertDebugMarkerDynamic",
@@ -1198,8 +1288,6 @@ static const char *const g_nops[] = {
     "nvnCommandBufferPushDebugGroupStatic",
     "nvnCommandBufferPopDebugGroupId",
     "nvnCommandBufferInsertDebugMarkerStatic",
-    "nvnCommandBufferWaitEvent",
-    "nvnWindowFinalize",
 };
 __attribute__((constructor)) static void nvn_nops_register(void) {
     // Empty implementations overwrite the unimplemented stubs after the slot table is initialized; a misspelled name (not in main's name table) reports a failure and aborts at startup
@@ -1245,6 +1333,17 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
+#if DM_NVN_M3
+NVN(nvnWindowFinalize, void, NVNwindow *w) {
+    win_t *o = (win_t *)w;
+    if (!w || o->magic != MAGIC('W', 'I', 'N', 'D')) {
+        LOG("[RED] WindowFinalize received an invalid window");
+        return;
+    }
+    mtl_present_flush();
+    memset(o, 0, sizeof *o);
+}
+#endif
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
@@ -1306,7 +1405,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    if (s) { ((sync_t *)s)->fenced = SYNC_FENCE_ACQUIRE; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -2472,6 +2571,6 @@ int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, si
 int nvn_host_signal_sync(void *nvnsync) {
     sync_t *o = nvnsync;
     if (!o || o->magic != MAGIC('S', 'Y', 'N', 'C')) return -1;
-    o->fence = 0; o->fenced = 1; return 0;
+    o->fence = 0; o->fenced = SYNC_FENCE_QUEUE; return 0;
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush

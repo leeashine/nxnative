@@ -5,6 +5,7 @@ uint64_t g_t0_ns;   // process start time from host main.c (used by hle_nvn's pe
 _Atomic uint64_t dm_present_ns;   // when the last present was made (hle_thread.c, DM_HITCH_DUMP); unit test stub
 #include "../tex/nvn_deswizzle.h"
 #include <time.h>
+#include <math.h>
 void *front_metal_layer(void) { return NULL; }   // no window in unit tests: present only counts
 module_t *module_of(const void *p) { (void)p; return NULL; }   // no guest modules in unit tests
 module_t g_mod[MAX_MOD]; int g_nmod;                            // host symbols that crash.c depends on
@@ -16,6 +17,13 @@ void nvn_present_config(int hz, int display_mode);
 #include <errno.h>
 #include <unistd.h>
 uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+#ifdef DM_NVN_TESTS
+void mtl_test_mark_fence_failed(uint64_t fence);
+int mtl_last_commit_error(void);
+void mtl_test_reset_fence_failures(void);
+int mtl_test_gpu_feedback_ns(uint32_t type, double gpu_start, double gpu_end, uint64_t guest, uint64_t host_now, uint64_t *out);
+uint64_t mtl_test_gpu_last_frame(void);
+#endif
 
 static int g_fail, g_n;
 #define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); g_n++;                 \
@@ -68,6 +76,21 @@ int main(void) {
     // 2. Device
     NVNdeviceBuilder db; P(nvnDeviceBuilderSetDefaults)(&db); P(nvnDeviceBuilderSetFlags)(&db, 0);
     EXPECT("DeviceInitialize succeeds", 1, P(nvnDeviceInitialize)(&dev, &db));
+#ifdef DM_NVN_M3
+    {
+        NVNsync sync; P(nvnSyncInitialize)(&sync, &dev);
+        EXPECT("classic QueueWaitSync rejects an unfenced sync", 0, P(nvnQueueWaitSync)(NULL, &sync));
+        NVNsync future; P(nvnSyncInitialize)(&future, &dev);
+        sync_t *future_state = (sync_t *)&future;
+        future_state->fenced = SYNC_FENCE_QUEUE;
+        future_state->fence = mtl_last_fence() + 1;
+        EXPECT("classic QueueWaitSync rejects a future fence", 0, P(nvnQueueWaitSync)(NULL, &future));
+        P(nvnSyncFinalize)(&future);
+        P(nvnQueueFenceSync)(NULL, &sync, (NVNsyncCondition)0, 0);
+        EXPECT("classic QueueWaitSync accepts a fenced sync", 1, P(nvnQueueWaitSync)(NULL, &sync));
+        P(nvnSyncFinalize)(&sync);
+    }
+#endif
     int v; P(nvnDeviceGetInteger)(&dev, NVN_DEVICE_INFO_UNIFORM_BUFFER_ALIGNMENT, &v);
     EXPECT("uniform buffer alignment (256 measured on X1)", 256, v);
     P(nvnDeviceGetInteger)(&dev, NVN_DEVICE_INFO_TEXTURE_DESCRIPTOR_SIZE, &v); EXPECT("texture descriptor size (32)", 32, v);
@@ -251,6 +274,7 @@ int main(void) {
         EXPECT("single texture bind recording: 0x20 + END", 0x28, P(nvnCommandBufferGetCommandMemoryUsed)(&c2));
         uint32_t patched = 0x1ff00000u | 1235; memcpy(m + at + 0x10, &patched, 4);
         memcpy(&rh, m, sizeof rh); p_bind_handles bt; const p_bind_handles *bh = bind_rec(rh.op, m + 8, &bt);
+        EXPECT("single texture bind uses compact opcode", OP_BIND_TEX1, rh.op);
         EXPECT("the bind reads the handle patched at its start + 0x10: slot 3, texture 1235, sampler 511", 1, rh.op == OP_BIND_TEX1 && bh->n == 1 && bh->first == 3 && bh->stage == NVN_SHADER_STAGE_FRAGMENT && bh->h[0] == patched);
         P(nvnCommandBufferFinalize)(&c2); P(nvnMemoryPoolFinalize)(&mp);
     }
@@ -267,6 +291,7 @@ int main(void) {
         EXPECT("maximum uniform range: 24-byte bind + END", 32, first_size);
         op_hdr rh; memcpy(&rh, m, sizeof rh);
         EXPECT("bounded uniform record is 24 bytes", 24, rh.size);
+        EXPECT("bounded uniform bind uses compact opcode", OP_BIND_UBO_SMALL, rh.op);
         p_bind_buf decoded; const p_bind_buf *b = bind_buf_rec(rh.op, m + 8, &decoded);
         EXPECT("bounded uniform decode keeps stage, index, address, size", 1,
                b->stage == NVN_SHADER_STAGE_FRAGMENT && b->index == 13 && b->addr == UINT64_C(0x123456789abc0000) && b->size == 65536);
@@ -313,6 +338,7 @@ int main(void) {
         EXPECT("single vertex buffer: 24-byte bind + END", 32, P(nvnCommandBufferGetCommandMemoryUsed)(&c2));
         op_hdr rh, end; memcpy(&rh, m, sizeof rh); memcpy(&end, m + rh.size, sizeof end);
         EXPECT("single vertex binding record is 24 bytes", 24, rh.size);
+        EXPECT("single vertex bind uses compact opcode", OP_BIND_VBUF1, rh.op);
         EXPECT("single vertex binding preserves adjacent END", 1, end.op == OP_END && end.size == 8);
         p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(rh.op, m + 8, &tmp);
         EXPECT("single vertex decode preserves slot, full address, maximum size", 1,
@@ -696,6 +722,10 @@ int main(void) {
         P(nvnWindowAcquireTexture)(&w3, NULL, &ix);
         EXPECT("acquire returns texture 0", 0, ix);
         mtl_present_test_stall(0); mtl_present_flush();
+#if DM_NVN_M3
+        P(nvnWindowFinalize)(&w3);
+        EXPECT("M3 WindowFinalize clears initialized window state", 0, ((win_t *)&w3)->magic);
+#endif
     }
 
     // 7. Unimplemented functions: return 0, report a failure, report only once
@@ -704,6 +734,17 @@ int main(void) {
     ((void (*)(void *))proc("nvnBufferBuilderGetDevice"))(NULL); ((void (*)(void *))proc("nvnBufferBuilderGetDevice"))(NULL);
     EXPECT("unimplemented function marked as reported ([RED]) after a call", 1, g_unimpl_seen[ui] > 0);
     EXPECT("unimplemented function count 2", 2, nvn_slot[ui].cnt);
+#ifdef DM_NVN_M3
+#define EXPECT_M3_REPORTED_STUB(name, call) do { \
+        unsigned idx = 0; while (strcmp(nvn_names[idx], #name)) idx++; \
+        call; EXPECT(#name " reports unsupported instead of succeeding", 1, g_unimpl_seen[idx] > 0); \
+    } while (0)
+    EXPECT_M3_REPORTED_STUB(nvnCommandBufferSetPatchSize, P(nvnCommandBufferSetPatchSize)(NULL, 16));
+    EXPECT_M3_REPORTED_STUB(nvnCommandBufferSetDepthBounds, P(nvnCommandBufferSetDepthBounds)(NULL, 0, 0.0f, 1.0f));
+    EXPECT_M3_REPORTED_STUB(nvnCommandBufferSetShaderScratchMemory, P(nvnCommandBufferSetShaderScratchMemory)(NULL, NULL, 0, 0));
+    EXPECT_M3_REPORTED_STUB(nvnCommandBufferWaitEvent, P(nvnCommandBufferWaitEvent)(NULL, NULL, 0, 0));
+#undef EXPECT_M3_REPORTED_STUB
+#endif
 
     // 8. A texture buffer as 2D rows for wrapped 1D fetches (x & 0x3FFF, x >> 14; nvn_mtl.m tbuf_as_2d): full rows back to back, one short row rounded to the alignment
     {
@@ -716,6 +757,142 @@ int main(void) {
         EXPECT("no elements: no rows", 0, nvn_tbuf_rows(0, 4, 64, &w, &h, &row));
         EXPECT("several rows whose alignment would break the wrapped address: refused", 0, nvn_tbuf_rows(20000, 4, 3, &w, &h, &row));
     }
+#ifdef DM_NVN_TESTS
+    {
+        uint64_t mapped = 0;
+        EXPECT("timestamp-top feedback maps GPU start into guest time", 1,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP_TOP, 99.5, 99.75, 20000000000ull, 100000000000ull, &mapped));
+        EXPECT("timestamp-top mapping preserves guest epoch", 19500000000ll, mapped);
+        EXPECT("timestamp feedback maps GPU end into guest time", 1,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP, 99.5, 99.75, 20000000000ull, 100000000000ull, &mapped));
+        EXPECT("timestamp mapping preserves guest epoch", 19750000000ll, mapped);
+        EXPECT("future GPU timestamp is rejected", 0,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP_TOP, 100.5, 99.75, 20000000000ull, 100000000000ull, &mapped));
+        EXPECT("GPU timestamp older than guest epoch is rejected", 0,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP, 99.5, 70.0, 20000000000ull, 100000000000ull, &mapped));
+        EXPECT("non-finite GPU timestamp is rejected", 0,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP, 99.5, NAN, 20000000000ull, 100000000000ull, &mapped));
+        EXPECT("missing guest time rejects GPU timestamp", 0,
+               mtl_test_gpu_feedback_ns(NVN_COUNTER_TYPE_TIMESTAMP, 99.5, 99.75, 0, 100000000000ull, &mapped));
+    }
+#ifdef DM_NVN_M3
+    {
+        NVNsync prior, completed;
+        P(nvnSyncInitialize)(&prior, &dev);
+        uint64_t prior_fence = mtl_last_fence();
+        P(nvnQueueFenceSync)(&q, &prior, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        EXPECT("queue fence snapshots the latest committed fence", prior_fence, ((sync_t *)&prior)->fence);
+        uint32_t marker = 0x21543687, before = 0;
+        memcpy(ub + 2048, &before, sizeof before);
+        P(nvnCommandBufferBeginRecording)(&cb);
+        P(nvnCommandBufferWaitSync)(&cb, &prior);
+        P(nvnCommandBufferUpdateUniformBuffer)(&cb, (NVNbufferAddress)ub, 4096, 2048, sizeof marker, &marker);
+        NVNcommandHandle wait_handle = P(nvnCommandBufferEndRecording)(&cb);
+        op_hdr wait_op; memcpy(&wait_op, (const void *)(uintptr_t)wait_handle, sizeof wait_op);
+        EXPECT("command-buffer wait records OP_WAIT_SYNC", OP_WAIT_SYNC, wait_op.op);
+        EXPECT("command-buffer wait record has a 16-byte ABI size", 16, wait_op.size);
+        P(nvnQueueSubmitCommands)(&q, 1, &wait_handle);
+        P(nvnSyncInitialize)(&completed, &dev);
+        P(nvnQueueFenceSync)(&q, &completed, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        int wait_result = P(nvnSyncWait)(&completed, UINT64_MAX);
+        EXPECT("earlier submitted WaitSync completes through queue order", 1,
+               wait_result == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || wait_result == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
+        EXPECT("ordered WaitSync does not fail the submission", 0, mtl_last_commit_error());
+        memcpy(&before, ub + 2048, sizeof before);
+        EXPECT("ordered WaitSync permits later commands", marker, before);
+        P(nvnSyncFinalize)(&completed);
+        P(nvnSyncFinalize)(&prior);
+    }
+    {
+        NVNsync same_submission;
+        P(nvnSyncInitialize)(&same_submission, &dev);
+        uint32_t marker = 0x76234518, before = 0;
+        memcpy(ub + 2052, &before, sizeof before);
+        P(nvnCommandBufferBeginRecording)(&cb);
+        P(nvnCommandBufferFenceSync)(&cb, &same_submission, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        P(nvnCommandBufferWaitSync)(&cb, &same_submission);
+        P(nvnCommandBufferUpdateUniformBuffer)(&cb, (NVNbufferAddress)ub, 4096, 2052, sizeof marker, &marker);
+        NVNcommandHandle same_handle = P(nvnCommandBufferEndRecording)(&cb);
+        const uint8_t *record = (const uint8_t *)(uintptr_t)same_handle;
+        op_hdr fence_op, wait_op;
+        memcpy(&fence_op, record, sizeof fence_op);
+        memcpy(&wait_op, record + fence_op.size, sizeof wait_op);
+        EXPECT("command-buffer fence precedes its wait", OP_FENCE_SYNC, fence_op.op);
+        EXPECT("same-submission wait follows the fence record", OP_WAIT_SYNC, wait_op.op);
+        EXPECT("command-buffer fence is assigned during replay", SYNC_FENCE_NONE, ((sync_t *)&same_submission)->fenced);
+        P(nvnQueueSubmitCommands)(&q, 1, &same_handle);
+        int wait_result = P(nvnSyncWait)(&same_submission, UINT64_MAX);
+        EXPECT("same-submission fence resolves as a command-buffer fence", SYNC_FENCE_COMMAND_BUFFER, ((sync_t *)&same_submission)->fenced);
+        EXPECT("same-submission fence targets its submission", mtl_last_fence(), ((sync_t *)&same_submission)->fence);
+        EXPECT("same-submission WaitSync is ordered without failing", 1,
+               !mtl_last_commit_error() &&
+               (wait_result == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || wait_result == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED));
+        memcpy(&before, ub + 2052, sizeof before);
+        EXPECT("same-submission WaitSync permits later commands", marker, before);
+        P(nvnSyncFinalize)(&same_submission);
+    }
+    {
+        NVNsync unfenced, completed;
+        P(nvnSyncInitialize)(&unfenced, &dev);
+        uint32_t before = 0, marker = 0x98765432;
+        memcpy(ub + 2056, &before, sizeof before);
+        P(nvnCommandBufferBeginRecording)(&cb);
+        P(nvnCommandBufferWaitSync)(&cb, &unfenced);
+        P(nvnCommandBufferUpdateUniformBuffer)(&cb, (NVNbufferAddress)ub, 4096, 2056, sizeof marker, &marker);
+        NVNcommandHandle invalid_handle = P(nvnCommandBufferEndRecording)(&cb);
+        P(nvnQueueSubmitCommands)(&q, 1, &invalid_handle);
+        P(nvnSyncInitialize)(&completed, &dev);
+        P(nvnQueueFenceSync)(&q, &completed, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        int wait_result = P(nvnSyncWait)(&completed, UINT64_MAX);
+        EXPECT("unfenced WaitSync fails the current submission", 1, mtl_last_commit_error());
+        EXPECT("unfenced WaitSync propagates a failed fence", NVN_SYNC_WAIT_RESULT_FAILED, wait_result);
+        EXPECT("QueueWaitSync propagates a failed fence", 0, P(nvnQueueWaitSync)(&q, &completed));
+        memcpy(&marker, ub + 2056, sizeof marker);
+        EXPECT("unfenced WaitSync aborts later commands", before, marker);
+        mtl_test_reset_fence_failures();
+        P(nvnSyncFinalize)(&completed);
+        P(nvnSyncFinalize)(&unfenced);
+    }
+    {
+        NVNsync future, completed;
+        P(nvnSyncInitialize)(&future, &dev);
+        sync_t *future_state = (sync_t *)&future;
+        future_state->fenced = SYNC_FENCE_QUEUE;
+        future_state->fence = mtl_last_fence() + 1;
+        uint32_t before = 0, marker = 0xabcdef01;
+        memcpy(ub + 2060, &before, sizeof before);
+        P(nvnCommandBufferBeginRecording)(&cb);
+        P(nvnCommandBufferWaitSync)(&cb, &future);
+        P(nvnCommandBufferUpdateUniformBuffer)(&cb, (NVNbufferAddress)ub, 4096, 2060, sizeof marker, &marker);
+        NVNcommandHandle invalid_handle = P(nvnCommandBufferEndRecording)(&cb);
+        P(nvnQueueSubmitCommands)(&q, 1, &invalid_handle);
+        P(nvnSyncInitialize)(&completed, &dev);
+        P(nvnQueueFenceSync)(&q, &completed, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        int wait_result = P(nvnSyncWait)(&completed, UINT64_MAX);
+        EXPECT("future-fence WaitSync fails instead of succeeding", 1, mtl_last_commit_error());
+        EXPECT("future-fence WaitSync propagates a failed fence", NVN_SYNC_WAIT_RESULT_FAILED, wait_result);
+        memcpy(&marker, ub + 2060, sizeof marker);
+        EXPECT("future-fence WaitSync aborts later commands", before, marker);
+        mtl_test_reset_fence_failures();
+        P(nvnSyncFinalize)(&completed);
+        P(nvnSyncFinalize)(&future);
+    }
+#endif
+    {
+        NVNsync failed_sync;
+        P(nvnSyncInitialize)(&failed_sync, &dev);
+        P(nvnQueueFenceSync)(&q, &failed_sync, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+        uint64_t fence = mtl_last_fence();
+        EXPECT("fence completes before error injection", 1, mtl_wait(fence, UINT64_MAX));
+        mtl_test_mark_fence_failed(fence);
+        EXPECT("fence error invalidates only this and later fences", 1,
+               !mtl_fence_failed(fence - 1) && mtl_fence_failed(fence) && mtl_fence_failed(fence + 1));
+        EXPECT("SyncWait propagates a completed fence error", NVN_SYNC_WAIT_RESULT_FAILED, P(nvnSyncWait)(&failed_sync, 0));
+        uint64_t gpu_frame = mtl_test_gpu_last_frame(), gpu_start, gpu_end;
+        EXPECT("completed main-queue work resolves frame GPU timing", 1, mtl_gpu_ms(gpu_frame) >= 0);
+        EXPECT("completed main-queue work has an ordered GPU timestamp span", 1, mtl_gpu_span(gpu_frame, &gpu_start, &gpu_end) && gpu_end >= gpu_start);
+    }
+#endif
 
     printf("== %d checks, %d failed ==\n", g_n, g_fail);
     return g_fail != 0;

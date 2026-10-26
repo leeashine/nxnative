@@ -1824,6 +1824,7 @@ GL(glGetUniformuiv, void, GLuint pr, GLint loc, GLuint *v) { uni_read(pr, loc, v
 
 // ---------- EGL ----------
 #define EGL_TRUE 1
+#define EGL_FALSE 0
 static struct { int init; int surface; uint32_t w, h; } g_egl;
 static uint64_t g_frames;
 // Every 300 frames: draws, passes, uploads; every 1800: memory (the process footprint, Metal's allocations, the GL objects alive), as the NVN layer's memory report
@@ -1883,7 +1884,8 @@ EGL(eglQueryString, const char *, EGLDisplay d, EGLint name) {
     switch (name) { case 0x3053: return "NVIDIA"; case 0x3054: return "1.5"; case 0x3055: return "EGL_KHR_create_context"; case 0x308d: return "OpenGL"; }   // VENDOR, VERSION, EXTENSIONS, CLIENT_APIS
     return NULL;
 }
-EGL(eglGetError, EGLint, void) { return 0x3000; }   // SUCCESS
+static __thread EGLint g_egl_error;
+EGL(eglGetError, EGLint, void) { EGLint e = g_egl_error; g_egl_error = 0; return e ? e : 0x3000; }   // EGL_SUCCESS when no error is pending
 EGL(eglQueryAPI, EGLenum, void) { return 0x30a2; }   // OPENGL_API
 EGL(eglWaitNative, EGLBoolean, EGLint engine) { (void)engine; return EGL_TRUE; }
 EGL(eglWaitGL, EGLBoolean, void) { return EGL_TRUE; }
@@ -1919,13 +1921,16 @@ static uint64_t g_next_swap;   // pacing without the display link: the earliest 
 EGL(eglSwapBuffers, EGLBoolean, EGLDisplay d, EGLSurface s) {
     (void)d; (void)s;
     dm_gfx_enter();
+    int present_error = 0;
     @autoreleasepool {
         if (!g_win.made) { int w, h; dm_vi_layer_size(&w, &h); win_make(w > 0 ? w : 1280, h > 0 ? h : 720); }
         if (g_pend_clear.bits) clears_flush();
         uint64_t v = cb_commit();
         int vs = S.swap_interval < 1 ? 1 : S.swap_interval > 4 ? 4 : S.swap_interval;
         int k = g_win.cur;
-        g_win.ticket[k] = mtl_present_ext(g_win.serial[k], vs / 60.0, (__bridge void *)g_ev, v, NULL);
+        uint64_t ticket = mtl_present_ext(g_win.serial[k], vs / 60.0, (__bridge void *)g_ev, v, NULL);
+        present_error = ticket == MTL_PRESENT_ERROR;
+        g_win.ticket[k] = present_error ? 0 : ticket;
         g_win.cur = (k + 1) % NWIN;
         if (g_win.ticket[g_win.cur]) mtl_present_wait(g_win.ticket[g_win.cur]);   // its previous present has been shown, so drawing into it again is safe
         // Paced by the display link when it runs, as the Vulkan layer's acquire: the swap interval in vsyncs
@@ -1938,7 +1943,8 @@ EGL(eglSwapBuffers, EGLBoolean, EGLDisplay d, EGLSurface s) {
     }
     dm_gfx_leave();
     frame_end();
-    return EGL_TRUE;
+    if (present_error && !g_egl_error) g_egl_error = 0x300e;   // EGL_CONTEXT_LOST: the producer fence did not complete
+    return present_error ? EGL_FALSE : EGL_TRUE;
 }
 // eglGetProcAddress: GL names from the same table as direct imports; anything else is null (the game's loader asks for every GL name it knows)
 static void *gl_lookup(const char *name) {
